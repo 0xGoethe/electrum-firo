@@ -95,7 +95,7 @@ class AddressSynchronizer(Logger):
         self.transaction_lock = threading.RLock()
         # Transactions pending verification.  txid -> tx_height. Access with self.lock.
         self.unverified_tx = defaultdict(int)
-        self._held_txs = {}  # server claims mined; do not apply effects before SPV
+        self._held_txs = {}  # failed local checks, but server claims mined; wait for SPV
         # true when synchronized
         self.up_to_date = False
         # thread local storage for caching stuff
@@ -499,7 +499,7 @@ class AddressSynchronizer(Logger):
     @with_lock
     def receive_tx_callback(self, tx_hash: str, tx: Transaction, tx_height: int) -> None:
         self.add_unverified_tx(tx_hash, tx_height)
-        if tx_height > 0 and not self.db.is_in_verified_tx(tx_hash):
+        if tx_height > 0 and not self._are_wallet_inputs_valid(tx):
             self._held_txs[tx_hash] = tx
             return
         self._held_txs.pop(tx_hash, None)
@@ -876,6 +876,8 @@ class AddressSynchronizer(Logger):
             if tx is not None:
                 self.add_transaction(tx, allow_unrelated=True)
                 self.find_islock_pair(tx_hash)
+        if tx is not None:
+            util.trigger_callback('wallet_updated', self)
         tx_mined_status = self.get_tx_height(tx_hash)
         util.trigger_callback('verified', self, tx_hash, tx_mined_status)
 

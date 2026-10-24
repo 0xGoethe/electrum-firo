@@ -791,10 +791,15 @@ class Transaction:
             raw = self.inputs()[txin_index].script_sig or b''
             if len(raw) > 10000:
                 return False
-            items = list(script_GetOp(raw))
-            if any(data is None or end > len(raw) for opcode, data, end in items):
-                return False
-            stack = [data for opcode, data, end in items]
+            stack = []
+            for opcode, data, end in script_GetOp(raw):
+                if opcode == opcodes.OP_1NEGATE:
+                    data = b'\x81'
+                elif opcodes.OP_1 <= opcode <= opcodes.OP_16:
+                    data = bytes([opcode - opcodes.OP_1 + 1])
+                if data is None or end > len(raw) or len(data) > 520:
+                    return False
+                stack.append(data)
             if script_type in ('p2pkh', 'exp2pkh'):
                 if len(stack) != 2:
                     return False

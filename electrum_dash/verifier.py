@@ -102,6 +102,8 @@ class SPV(NetworkJobOnDefaultServer):
         except UntrustedServerReturnedError as e:
             if not isinstance(e.original_exception, aiorpcx.jsonrpc.RPCError):
                 raise
+            if self.wallet.is_held_tx(tx_hash):
+                raise GracefulDisconnect(f'cannot verify held transaction {tx_hash}') from e
             self.logger.info(f'tx {tx_hash} not at height {tx_height}')
             self.wallet.remove_unverified_tx(tx_hash, tx_height)
             self.requested_merkle.discard(tx_hash)
