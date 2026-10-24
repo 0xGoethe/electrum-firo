@@ -35,7 +35,7 @@ from .bitcoin import COINBASE_MATURITY
 from .dash_ps import PSManager
 from .dash_ps_util import PSCoinRounds, PS_MIXING_TX_TYPES
 from .dash_tx import tx_header_to_tx_type
-from .util import profiler, bfh, TxMinedInfo, UnrelatedTransactionException, with_lock
+from .util import profiler, bfh, TxMinedInfo, UnrelatedTransactionException, InvalidTxSignature, with_lock
 from .protx import ProTxManager
 from .transaction import Transaction, TxOutput, TxInput, PartialTxInput, TxOutpoint, PartialTransaction
 from .synchronizer import Synchronizer
@@ -95,6 +95,7 @@ class AddressSynchronizer(Logger):
         self.transaction_lock = threading.RLock()
         # Transactions pending verification.  txid -> tx_height. Access with self.lock.
         self.unverified_tx = defaultdict(int)
+        self._held_txs = {}  # server claims mined; do not apply effects before SPV
         # true when synchronized
         self.up_to_date = False
         # thread local storage for caching stuff
@@ -119,6 +120,10 @@ class AddressSynchronizer(Logger):
         self.load_local_history()
         self.check_history()
         self.load_unverified_transactions()
+        for txid in list(self.db.transactions):
+            tx = self.db.get_transaction(txid)
+            if tx is not None and not self._are_wallet_inputs_valid(tx):
+                self.remove_transaction(txid)
         self.remove_local_transactions_we_dont_have()
         self.populate_tx_deltas_cache()
         self.populate_addrs_with_coins_cache()
@@ -317,6 +322,10 @@ class AddressSynchronizer(Logger):
             # prevent lelantus transasctions stored as cb.
             is_coinbase = tx.inputs()[0].is_coinbase_input() and not (tx.inputs()[0].is_lelantus_input() or tx.inputs()[0].is_spark_input())
             tx_height = self.get_tx_height(tx_hash).height
+            if not self._are_wallet_inputs_valid(tx):
+                if self.db.get_transaction(tx_hash) is not None:
+                    self.remove_transaction(tx_hash)
+                raise InvalidTxSignature()
             if not allow_unrelated:
                 # note that during sync, if the transactions are not properly sorted,
                 # it could happen that we think tx is unrelated but actually one of the inputs is is_mine.
@@ -383,6 +392,10 @@ class AddressSynchronizer(Logger):
                     # give v to txi that spends me
                     next_tx = self.db.get_spent_outpoint(tx_hash, n)
                     if next_tx is not None:
+                        spender = self.db.get_transaction(next_tx)
+                        if spender is not None and not self._are_wallet_inputs_valid(spender, prev_tx=tx):
+                            self.remove_transaction(next_tx)
+                            continue
                         self.db.add_txi_addr(next_tx, addr, ser, v)
                         self._add_tx_to_local_history(next_tx)
             # add to local history
@@ -463,8 +476,33 @@ class AddressSynchronizer(Logger):
                 children |= self.get_depending_transactions(other_hash)
             return children
 
+    def _are_wallet_inputs_valid(self, tx: Transaction, *, prev_tx: Transaction = None) -> bool:
+        if not tx.is_complete() or self.db.is_in_verified_tx(tx.txid()):
+            return True
+        # Ignore PSBT-provided addresses and inspect exactly the bytes stored in history.
+        if isinstance(tx, PartialTransaction):
+            tx = Transaction(tx.serialize_to_network())
+        for index, txin in enumerate(tx.inputs()):
+            if txin.is_coinbase_input():
+                continue
+            prev_hash = txin.prevout.txid.hex()
+            parent = prev_tx if prev_tx is not None and prev_tx.txid() == prev_hash else self.db.get_transaction(prev_hash)
+            if parent is None:
+                continue  # rechecked when the parent arrives
+            if txin.prevout.out_idx >= len(parent.outputs()):
+                return False
+            output = parent.outputs()[txin.prevout.out_idx]
+            if self.is_mine(output.address) and tx.verify_input_signature(index, output.scriptpubkey) is False:
+                return False
+        return True
+
+    @with_lock
     def receive_tx_callback(self, tx_hash: str, tx: Transaction, tx_height: int) -> None:
         self.add_unverified_tx(tx_hash, tx_height)
+        if tx_height > 0 and not self.db.is_in_verified_tx(tx_hash):
+            self._held_txs[tx_hash] = tx
+            return
+        self._held_txs.pop(tx_hash, None)
         self.add_transaction(tx, allow_unrelated=True)
         self.find_islock_pair(tx_hash)
 
@@ -493,7 +531,10 @@ class AddressSynchronizer(Logger):
             tx = self.db.get_transaction(tx_hash)
             if tx is None:
                 continue
-            self.add_transaction(tx, allow_unrelated=True)
+            try:
+                self.add_transaction(tx, allow_unrelated=True)
+            except InvalidTxSignature:
+                self.logger.warning(f'removed tx with invalid signature: {tx_hash}')
 
         # Store fees
         for tx_hash, fee_sat in tx_fees.items():
@@ -528,7 +569,10 @@ class AddressSynchronizer(Logger):
                     continue
                 tx = self.db.get_transaction(tx_hash)
                 if tx is not None:
-                    self.add_transaction(tx, allow_unrelated=True)
+                    try:
+                        self.add_transaction(tx, allow_unrelated=True)
+                    except InvalidTxSignature:
+                        self.logger.warning(f'removed tx with invalid signature: {tx_hash}')
 
     def remove_local_transactions_we_dont_have(self):
         for txid in itertools.chain(self.db.list_txi(), self.db.list_txo()):
@@ -613,6 +657,7 @@ class AddressSynchronizer(Logger):
 
     def clear_history(self):
         with self.lock:
+            self._held_txs.clear()
             with self.transaction_lock:
                 self.db.clear_history()
                 self._history_local.clear()
@@ -820,14 +865,27 @@ class AddressSynchronizer(Logger):
             new_height = self.unverified_tx.get(tx_hash)
             if new_height == tx_height:
                 self.unverified_tx.pop(tx_hash, None)
+                self._held_txs.pop(tx_hash, None)
 
     def add_verified_tx(self, tx_hash: str, info: TxMinedInfo):
         # Remove from the unverified map and add to the verified map
         with self.lock:
             self.unverified_tx.pop(tx_hash, None)
             self.db.add_verified_tx(tx_hash, info)
+            tx = self._held_txs.pop(tx_hash, None)
+            if tx is not None:
+                self.add_transaction(tx, allow_unrelated=True)
+                self.find_islock_pair(tx_hash)
         tx_mined_status = self.get_tx_height(tx_hash)
         util.trigger_callback('verified', self, tx_hash, tx_mined_status)
+
+    @with_lock
+    def is_held_tx(self, tx_hash: str) -> bool:
+        return tx_hash in self._held_txs and self.unverified_tx.get(tx_hash, 0) > 0
+
+    @with_lock
+    def clear_held_txs(self):
+        self._held_txs.clear()
 
     def get_unverified_txs(self):
         '''Returns a map from tx hash to transaction height'''

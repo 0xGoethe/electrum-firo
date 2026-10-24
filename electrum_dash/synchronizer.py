@@ -165,6 +165,7 @@ class Synchronizer(SynchronizerBase):
         self.requested_tx = {}
         self.requested_histories = set()
         self._stale_histories = dict()  # type: Dict[str, asyncio.Task]
+        self.wallet.clear_held_txs()
 
     def diagnostic_name(self):
         return self.wallet.diagnostic_name()
@@ -226,6 +227,8 @@ class Synchronizer(SynchronizerBase):
             tx = self.wallet.db.get_transaction(tx_hash)
             if tx and not isinstance(tx, PartialTransaction):
                 continue  # already have complete tx
+            if self.wallet.is_held_tx(tx_hash):
+                continue
             transaction_hashes.append(tx_hash)
             self.requested_tx[tx_hash] = tx_height
 
@@ -251,7 +254,9 @@ class Synchronizer(SynchronizerBase):
         tx = Transaction(raw_tx)
         if tx_hash != tx.txid():
             raise SynchronizerFailure(f"received tx does not match expected txid ({tx_hash} != {tx.txid()})")
-        tx_height = self.requested_tx.pop(tx_hash)
+        self.requested_tx.pop(tx_hash)
+        # A history notification can change the height while the request is in flight.
+        tx_height = self.wallet.get_tx_height(tx_hash).height
         self.wallet.receive_tx_callback(tx_hash, tx, tx_height)
         self.logger.info(f"received tx {tx_hash} height: {tx_height} bytes: {len(raw_tx)}")
 

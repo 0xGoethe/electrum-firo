@@ -752,6 +752,96 @@ class Transaction:
         s += int_to_hex(txin.nsequence, 4)
         return s
 
+    def _signature_hash(self, txin_index: int, script: bytes, sighash: int) -> bytes:
+        """Legacy signature hash for the standard scripts verified below."""
+        mode = sighash & 0x1f
+        inputs, outputs = self.inputs(), self.outputs()
+        if mode == 3 and txin_index >= len(outputs):  # historical SIGHASH_SINGLE bug
+            return b'\x01' + bytes(31)
+        selected = [(txin_index, inputs[txin_index])] if sighash & 0x80 else list(enumerate(inputs))
+        txins = var_int(len(selected))
+        for index, txin in selected:
+            sequence = 0 if index != txin_index and mode in (2, 3) else txin.nsequence
+            txins += txin.prevout.serialize_to_network().hex()
+            txins += to_varbytes(script if index == txin_index else b'').hex()
+            txins += int_to_hex(sequence, 4)
+        if mode == 2:  # SIGHASH_NONE
+            txouts = '00'
+        elif mode == 3:  # SIGHASH_SINGLE
+            txouts = var_int(txin_index + 1) + 'ffffffffffffffff00' * txin_index
+            txouts += outputs[txin_index].serialize_to_network().hex()
+        else:
+            txouts = var_int(len(outputs)) + ''.join(o.serialize_to_network().hex() for o in outputs)
+        version = self.version | (self.tx_type << 16)
+        preimage = int_to_hex(version, 4) + txins + txouts + int_to_hex(self.locktime, 4)
+        if self.tx_type:
+            preimage += to_varbytes(serialize_extra_payload(self)).hex()
+        return sha256d(bfh(preimage + int_to_hex(sighash, 4)))
+
+    def verify_input_signature(self, txin_index: int, script: bytes) -> Optional[bool]:
+        """Check a standard transparent spend. None means an unsupported script.
+
+        The script must come from the previous output, not from input metadata.
+        This is not a general script interpreter or a privacy-proof verifier.
+        """
+        script_type = get_script_type_from_output_script(script)
+        if script_type not in ('p2pkh', 'exp2pkh', 'p2sh'):
+            return None
+        try:
+            raw = self.inputs()[txin_index].script_sig or b''
+            if len(raw) > 10000:
+                return False
+            items = list(script_GetOp(raw))
+            if any(data is None or end > len(raw) for opcode, data, end in items):
+                return False
+            stack = [data for opcode, data, end in items]
+            if script_type in ('p2pkh', 'exp2pkh'):
+                if len(stack) != 2:
+                    return False
+                signature, pubkey = stack
+                if hash_160(pubkey) != script[-22:-2]:
+                    return False
+                signatures, pubkeys = [signature], [pubkey]
+            else:
+                if not stack or hash_160(stack[-1]) != script[2:22]:
+                    return False
+                script = stack[-1]
+                redeem = list(script_GetOp(script))
+                if (len(redeem) < 4 or redeem[-1][0] != opcodes.OP_CHECKMULTISIG
+                        or not opcodes.OP_1 <= redeem[0][0] <= opcodes.OP_16
+                        or not opcodes.OP_1 <= redeem[-2][0] <= opcodes.OP_16):
+                    return None  # arbitrary imported watch-only P2SH script
+                required = redeem[0][0] - opcodes.OP_1 + 1
+                pubkeys = [data for opcode, data, end in redeem[1:-2]]
+                if (len(pubkeys) != redeem[-2][0] - opcodes.OP_1 + 1
+                        or not 1 <= required <= len(pubkeys)
+                        or any(pk is None or len(pk) not in (33, 65) for pk in pubkeys)
+                        or any(end > len(script) for opcode, data, end in redeem)
+                        or len(stack) != required + 2 or stack[0] != b''):
+                    return False
+                signatures = stack[1:-1]
+            # CHECKMULTISIG matches signatures to keys in script order, at most once per key.
+            sig_index = 0
+            hashes = {}
+            for pubkey in pubkeys:
+                signature = signatures[sig_index]
+                if not signature or (signature[-1] & ~0x80) not in (1, 2, 3):
+                    return False
+                sighash = signature[-1]
+                if sighash not in hashes:
+                    hashes[sighash] = self._signature_hash(txin_index, script, sighash)
+                try:
+                    sig = ecc.sig_string_from_der_sig(signature[:-1])
+                except Exception:  # the ECC decoder raises a plain Exception for bad DER
+                    return False
+                if ecc.verify_signature(pubkey, sig, hashes[sighash]):
+                    sig_index += 1
+                    if sig_index == len(signatures):
+                        return True
+            return False
+        except (MalformedBitcoinScript, ValueError, IndexError, ecc.InvalidECPointException):
+            return False
+
     def invalidate_ser_cache(self):
         self._cached_network_ser = None
         self._cached_txid = None
